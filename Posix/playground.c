@@ -1,218 +1,184 @@
-/* 
- * Si consideri il traffico di macchine in prossimità di un quadrivio. Implementare le
- * macchine come thread paralleli e gestire il transito delle macchine in base alle
- * seguenti regole:
- * 
- *      - una macchina appare inizialmente, dopo certo tempo random, in una delle strade
- *        che compongono il quadrivio. Se vi sono altre macchine in attesa nella stessa strada,
- *        essa si mette in coda ad esse.
- * 
- *      - solo una macchina alla volta può transitare l'incrocio.
- * 
- *      - una macchina può transitare l’incrocio solo se ha la destra libera. Se nessuna
- *        macchina ha la destra libera, una macchina a caso transiterà l'incrocio.
-*/
-
 #include <stdio.h>
 #include <stdlib.h>
-#include <pthread.h>
-#include <unistd.h>
+#include "mpi.h"
 
-#define NUM_BUFFER 4
-#define DIM_BUFFER 3
+#define NTHREADS 4
+#define NSTEPS 20
 
-#define NUM_PRODUCERS NUM_BUFFER
-#define NUM_CONSUMERS NUM_BUFFER
-
-#define STAMPA  1   /* 0 : non stampare,  1 : stampa  */
-#define PRODUCI 1   /* 0 : non produrre,  1 : produci */
-#define CONSUMA 1   /* 0 : non consumare, 1 : consuma */
-
-#define LIBERO   0
-#define OCCUPATO 1
-
-/* attenzione! nel ciclo while del thread producer è impostato che il buffer-0 non viene mai riempito! */
-
-
-struct Buffer {
-    /* todo: fix false sharing */
-    pthread_mutex_t mutex;
-    pthread_cond_t condTuttoPieno;
-    pthread_cond_t condTuttoVuoto;
-    int id;
-    int buffer[DIM_BUFFER];
-    int headIndex;
+struct ant {
+    int pos, dir; // 0 ovest, 1 est
 };
 
-struct Buffer buffers[NUM_BUFFER];
 
-void* printBuffers(void* arg) {
+ant* ants, local_sx, local_dx;
+ant** V, localReadV, localWriteV;
+int nAnts, nCells, nPerThread, myrank;
+MPI_Datatype structType;
 
-    while(STAMPA) {
-        // usleep(160000);
+void init() {
+    V = new ant*[nCells];
 
-        /* acquisisco tutti i lock */
-        for(int b=0; b<NUM_BUFFER; b++)
-            pthread_mutex_lock(&buffers[b].mutex);
-
-        for(int b=0; b<NUM_BUFFER; b++) {
-            printf("##   BUFFER-%d   ## -> [ ", b);
-            for(int i=0; i<DIM_BUFFER; i++)
-                if(buffers[b].buffer[i] == LIBERO)
-                    printf(" • ");
-                else if(buffers[b].buffer[i] == OCCUPATO)
-                    printf(" 🚖 ");
-                else
-                    printf(" ? ");
-            printf(" ]\n");
-        }
-        printf("\n");
-
-        /* rilascio tutti i lock */
-        for(int b=0; b<NUM_BUFFER; b++)
-            pthread_mutex_unlock(&buffers[b].mutex);
+    for(int i = 0; i < nAnts; i++) {
+        V[ants[i].pos] = &ants[i];
     }
-    return NULL;
+
+    MPI_Type_create_struct(1, 2, 0, MPI_INT, &structType); //count, blockcounts, offset
+    MPI_Type_commit(&structType);
 }
 
-void* producer(void* id_buffer) {
-    /** ogni producer è associato ad un buffer! **/
-    int id = *(int*) id_buffer;
-    struct Buffer* myBuffer = &buffers[id];
+void printArray(int it) {
+    printf("----- ITER: %d -----\n|", it);
 
-    while(PRODUCI && id!=0) {   /* DEBUG: TOGLIERE QUEL "&& ID!=0" */
-
-        /* acquisisco il lock sul buffer */
-        pthread_mutex_lock(&myBuffer->mutex);
-        
-        /* se il buffer è pieno mi metto in attesa */
-        while(myBuffer->headIndex >= DIM_BUFFER)
-            pthread_cond_wait(&myBuffer->condTuttoPieno, &myBuffer->mutex);
-            
-
-        /* se c'è almeno una cella libera, aggiungo una macchina alla coda */
-        myBuffer->buffer[myBuffer->headIndex] = OCCUPATO;
-        myBuffer->headIndex++;
-
-        
-        /* rilascio il lock sul buffer */
-        pthread_mutex_unlock(&myBuffer->mutex);
-
-        /* sveglio i consumer in attesa */
-        pthread_cond_broadcast(&myBuffer->condTuttoVuoto);
+    for(int i = 0; i < nCells; i++) {
+        printf("%d|", V[i]);
     }
-    return NULL;
+    printf("\n");
 }
 
-void* consumer(void* id_buffer) {
-    /** ogni consumer è associato ad un buffer! **/
-    int id = *(int*) id_buffer;
-    struct Buffer* myBuffer = &buffers[id];
 
-    while(CONSUMA) {
+void exchangeBorders() {
+    if(myrank == 0) {
 
-        int idBufferMio = myBuffer->id;
-        int idBufferDestra = (myBuffer->id + NUM_BUFFER - 1) % NUM_BUFFER;
+        for(int i = 1; i < NTHREADS; i++) {
+            if(i == 1) {
+                MPI_Send(V[i*nPerThread], 1, structType, i, 0, MPI_COMM_WORLD); // invia solo cella_dx a thread 1
+            }
 
-        /* acquisisco i lock sul mio buffer e su quello di destra */
-        if(idBufferMio < idBufferDestra) {
-            pthread_mutex_lock(&buffers[idBufferMio].mutex);
-            pthread_mutex_lock(&buffers[idBufferDestra].mutex);
-        } else {
-            pthread_mutex_lock(&buffers[idBufferDestra].mutex);
-            pthread_mutex_lock(&buffers[idBufferMio].mutex);
+            else if(i == (NTHREADS-1)) {
+                MPI_Send(V[(i-1)*nPerThread-1], 1, structType, i, 0, MPI_COMM_WORLD); // invia cella_sx ad ultimo thread
+            }
+
+            else {
+                MPI_Send(V[(i-1)*nPerThread-1], 1, structType, i, 0, MPI_COMM_WORLD); // invia cella_sx ad ogni thread
+                MPI_Send(V[i*nPerThread], 1, structType, i, 0, MPI_COMM_WORLD); // invia cella_dx ad ogni thread
+            }
+        }        
+    }
+
+    else {
+
+        if(myrank == 1) {
+            MPI_Recv(local_dx, 1, structType, 0, 0, MPI_COMM_WORLD);
         }
-        
-        /* se il buffer è vuoto mi metto in attesa */
-        while(myBuffer->headIndex <= 0)
-            pthread_cond_wait(&myBuffer->condTuttoVuoto, &myBuffer->mutex);
 
-        /* se ho la destra libera, passo */
-        if(buffers[idBufferDestra].headIndex == 0) {
-            printf("ho la destra libera, passo io (%d), PISTAAA.. dx:%d\n", id, buffers[idBufferDestra].buffer[0]);
-            myBuffer->buffer[0] = LIBERO;
-            
-            /* faccio scorrere il traffico */
-            for(int i=1; i<DIM_BUFFER; i++) {
-                if(myBuffer->buffer[i] == OCCUPATO) {
-                    myBuffer->buffer[i]   = LIBERO;
-                    myBuffer->buffer[i-1] = OCCUPATO;
-                    myBuffer->headIndex = i;
+        else if(myrank == (NTHREADS-1)) {
+            MPI_Recv(local_sx, 1, structType, 0, 0, MPI_COMM_WORLD);
+        }
+
+        else {
+            MPI_Recv(local_sx, 1, structType, 0, 0, MPI_COMM_WORLD);
+            MPI_Recv(local_dx, 1, structType, 0, 0, MPI_COMM_WORLD);
+        }
+    }
+}
+
+void move(int it) {
+
+    if(myrank == 0) {
+        printArray(it);  // visualizza l'array completo aggiornato
+    }  
+
+    exchangeBorders();
+
+    if(myrank != 0) {
+        bool movedInLocal_dx = false, movedInLocal_sx = false;
+
+        for(int i = 0; i < nPerThread; i++) {
+            if(localReadV[i] != NULL) { 
+                if(localReadV[i]->dir == 0) {
+                    if(localReadV[i]->pos > 0 && localReadV[i-1] == NULL) { // sposta la formica in pos i-1
+                        ant* tmp = localReadV[i];
+                        localWriteV[i] = NULL;
+                        localWriteV[i-1] = tmp;
+                        localWriteV[i-1]->pos--;
+                    }
+                    else if(localReadV[i]->pos == 0 && myrank > 1 && local_sx == NULL) { // sposta la formica in local_sx
+                        ant* tmp = localReadV[i];
+                        localWriteV[i] = NULL;
+                        local_sx = tmp;
+                        localWriteV[i-1]->pos--;
+                        movedInLocal_sx = true;
+                    }
+                    else localReadV[i]->dir = 1;
+                }
+
+                else {  // dir == 1
+                    if(localReadV[i]->pos < (nPerThread-1) && localReadV[i+1] == NULL) { // sposta la formica in pos i+1
+                        ant* tmp = localReadV[i];
+                        localWriteV[i] = NULL;
+                        localWriteV[i+1] = tmp;
+                        localWriteV[i-1]->pos++;
+                    }
+                    else if(localReadV[i]->pos == (nPerThread-1) && myrank != (NTHREADS-1) && local_dx == NULL) { // sposta la formica in local_dx
+                        ant* tmp = localReadV[i];
+                        localWriteV[i] = NULL;
+                        local_dx = tmp;                        
+                        localWriteV[i-1]->pos++;
+                        movedInLocal_dx = true;
+                    }
+                    else localReadV[i]->dir = 0;
                 }
             }
         }
-        
-        /* rilascio i lock sui buffer */
-        pthread_mutex_unlock(&buffers[idBufferMio].mutex);
-        pthread_mutex_unlock(&buffers[idBufferDestra].mutex);
 
-        /* sveglio i producer in attesa */
-        pthread_cond_broadcast(&myBuffer->condTuttoPieno);
-    }
-    return NULL;
-}
+        if(myrank > 1 && local_sx != NULL && !movedInLocal_sx && local_sx->dir == 1 && localWriteV[0] == NULL) { // sposta la formica da local_sx a pos 0
+            ant* tmp = local_sx;
+            local_sx = NULL;
+            localWritev[0] = tmp;                        
+            localWriteV[0]->pos++;
+        }
 
-void init() {
+        if(myrank < (NTHREADS-1) && local_dx != NULL && !movedInLocal_dx && local_dx->dir == 0 && localWriteV[nPerThread-1] == NULL) { // sposta la formica da local_dx a pos nPerThread-1
+            ant* tmp = local_dx;
+            local_dx = NULL;
+            localWritev[nPerThread-1] = tmp;                        
+            localWriteV[nPerThread-1]->pos--;
+        }
 
-    /* inizializzo tutti i buffer */
-    for(int b=0; b<NUM_BUFFER; b++) {
-
-        /* inizializzo i lock */
-        pthread_mutex_init(&buffers[b].mutex, NULL);
-
-        /* inizializzo le condition */
-        pthread_cond_init(&buffers[b].condTuttoPieno, NULL);
-        pthread_cond_init(&buffers[b].condTuttoVuoto, NULL);
-
-        /* inizializzo l'id del buffer */
-        buffers[b].id = b;
-        
-        /* inizializzo i posti del buffer a LIBERO */
-        for(int i=0; i<DIM_BUFFER; i++)
-            buffers[b].buffer[i] = LIBERO;
-
-        /* inizializzo la testa del buffer */
-        buffers[b].headIndex = 0;
+        ant** p = localReadV;
+        localReadV = localWriteV;
+        localWriteV = p;
     }
 
+    // ogni thread invia il proprio localReadV a thread 0
+    MPI_Gather(localReadV, nPerThread, structType, V, nCells, structType, 0, MPI_COMM_WORLD);
 }
 
-int main() {
-    
-    /* inizializzo le variabili */
+
+void setVariables(int numAnts, int numCells) {
+    nAnts = numAnts;
+    nCells = numCells;
+    nPerThread = nCells / (NTHREADS-1);
+}
+
+void setPosDir(int index, int p, int d) {
+    ants[index].pos = p;
+    ants[index].dir = d; 
+
+    printf("Formica %d: pos %d --- dir %d\n", ants[index].thid, ants[index].pos, ants[index].dir);
+}
+
+int main(int argc, char* argv[]) {
+
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
+
+    setVariables(5, 12); // nAnts, nCells
+    ants = new ant[nAnts];
+
+    for(int i = 0; i < nAnts; i++) {
+        setPosDir(i, i*2, i%2);
+    }
+
     init();
 
-    /* avvio il thread stampatore */
-    pthread_t printer;
-    pthread_create(&printer, NULL, &printBuffers, NULL);
-
-    /* avvio i producer - uno per buffer */
-    pthread_t producers[NUM_PRODUCERS];
-    for(int p=0; p<NUM_BUFFER; p++) {
-        int* ptr_id = malloc(sizeof(int));
-	    *ptr_id = p;
-        pthread_create(&producers[p], NULL, &producer, ptr_id);
+    for(int i = 0; i < NSTEPS; i++) {
+        printf("e movati\n");
+        move(i);
     }
 
-    /* avvio i consumer - uno per buffer */
-    pthread_t consumers[NUM_CONSUMERS];
-    for(int c=0; c<NUM_BUFFER; c++) {
-        int* ptr_id = malloc(sizeof(int));
-	    *ptr_id = c;
-        pthread_create(&consumers[c], NULL, &consumer, ptr_id);
-    }
-
-    /* attendo che il thread stampatore termini */
-    pthread_join(printer, NULL);
-
-    /* attendo che i producer terminino */
-    for(int p=0; p<NUM_BUFFER; p++)
-        pthread_join(producers[p], NULL);
-
-    /* attendo che i consumer terminino */
-    for(int c=0; c<NUM_BUFFER; c++)
-        pthread_join(consumers[c], NULL);
-
+    delete [] V;
+    MPI_Finalize();
 
     return 0;
 }
