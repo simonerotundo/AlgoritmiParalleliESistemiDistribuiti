@@ -15,7 +15,7 @@
 #define OCCUPATO 1
 
 
-pthread_t lockBuffer;
+pthread_mutex_t lockBuffer;
 pthread_cond_t condEmpty;
 pthread_cond_t condFull;
 
