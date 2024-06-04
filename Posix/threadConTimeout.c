@@ -1,62 +1,66 @@
-/**
- * 
- * TRACCIA DEL 16-01-2024
- * 
-**/
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
 
-#define TIMEOUT 1 /* secondi o microsecondi? */
+#define false 0
+#define true  1
+
+#define WAIT_TIME 100
+#define EXTRA_TIME 1
+
 
 pthread_t thread;
+pthread_t timer;
 pthread_mutex_t lock;
-int threadTerminato = 0;
+int threadTerminato;
 
-void* doSomething() {
-    usleep(TIMEOUT*2);
 
-    printf("doSomething()..\n");
-
-    pthread_mutex_lock(&lock);
-    threadTerminato = 1;
-    pthread_mutex_unlock(&lock);
-
+void* threadTimer(void* arg) {
+    usleep(WAIT_TIME);
     return NULL;
 }
 
-void doInTheMeantime() { 
-    printf("doInTheMeantime()..\n");
-}
+void* threadRun(void* arg) {
+    
+    /* effettuo delle operazioni */
+    printf("thread inizio...\n");
+    usleep(WAIT_TIME+EXTRA_TIME);
 
-void startAsynch() {
-    pthread_mutex_init(&lock, NULL);
-    pthread_create(&thread, NULL, &doSomething, NULL);
-}
-
-void waitEnd(int t) {
-    usleep(t);
+    /* indico che ho terminato l'esecuzione */
     pthread_mutex_lock(&lock);
-    if(threadTerminato) { 
-        /* il thread ha terminato per tempo */
-        printf("[ status: THREAD OK ]\n");
-        pthread_join(thread, NULL);
-    } else { 
-        /* il thread non ha terminato per tempo */
-        printf("[ status: THREAD KILLED ]\n");
-        pthread_cancel(thread);
-    }
+    threadTerminato = true;
     pthread_mutex_unlock(&lock);
+    printf("thread fine...\n");
+
+    /* termino */
+    return NULL;
+}
+
+void init() {
+    threadTerminato = false;
 }
 
 int main(int argc, char* argv[]) {
 
-    startAsynch();
-    doInTheMeantime();
-    waitEnd(TIMEOUT);
+    init();
+
+    /* avvio il thread operaio */
+    pthread_create(&thread, NULL, threadRun, NULL);
+
+    /* avvio il thread timer e aspetto che scada il tempo - TODO: fare la join in un thread separato, in modo da ottimizzare meglio */
+    pthread_create(&timer, NULL, threadTimer, NULL);
+    pthread_join(timer, NULL);
+
+    /*
+    ...
+    */
+
+    /* stampo lo stato del thread */
+    pthread_mutex_lock(&lock);
+    printf("Main terminato -> %d\n", threadTerminato);
+    pthread_mutex_unlock(&lock);
 
     return 0;
 }
